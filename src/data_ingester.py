@@ -3,48 +3,9 @@ import json
 from datetime import datetime
 from elasticsearch import AsyncElasticsearch, ConnectionError, NotFoundError, ApiError
 
-# Змінено: Змінна es тепер ініціалізується як None. 
-# Клієнт буде створений асинхронно функцією initialize_es_client()
-es: AsyncElasticsearch = None 
-
+# Змінено: Змінна es більше не є глобальною і не ініціалізується тут.
+# Вона буде передаватися як аргумент до функцій.
 INDEX_NAME = "scan_results"
-
-# Функція для асинхронної ініціалізації клієнта Elasticsearch
-async def initialize_es_client():
-    global es
-    if es: # Якщо клієнт вже існує, закриваємо його, щоб уникнути Unclosed client session
-        try:
-            await es.close()
-            print("Попередній клієнт Elasticsearch закрито.")
-        except Exception as e:
-            print(f"Помилка при закритті попереднього клієнта ES: {e}")
-            
-    try:
-        es = AsyncElasticsearch([{'host': 'localhost', 'port': 9284, 'scheme': 'http'}])
-        if await es.ping():
-            print("Успішно підключено до Elasticsearch.")
-            return True
-        else:
-            print("Попередження: Не вдалося підключитися до Elasticsearch. Перевірте, чи він запущений на http://localhost:9284")
-            es = None # Якщо ping не вдається, вважаємо, що es не підключений
-            return False
-    except ConnectionError as e:
-        print(f"Помилка підключення до Elasticsearch: {e}")
-        es = None
-        return False
-    except Exception as e:
-        print(f"Критична помилка при ініціалізації клієнта Elasticsearch: {e}")
-        es = None
-        return False
-
-# Функція для закриття клієнта Elasticsearch
-async def close_es_client():
-    global es
-    if es:
-        print("Закриття клієнта Elasticsearch...")
-        await es.close()
-        print("Клієнт Elasticsearch закрито.")
-        es = None
 
 # ---- Заглушки для збагачення даних ----
 def get_geolocation(ip_address):
@@ -128,13 +89,14 @@ def format_document(scan_result):
     }
     return document
 
-async def ingest_scan_results(results_queue):
+async def ingest_scan_results(es_client: AsyncElasticsearch, results_queue: asyncio.Queue):
     """
     Асинхронно отримує результати сканування з черги, збагачує їх та індексує в Elasticsearch.
+    es_client: екземпляр AsyncElasticsearch
+    results_queue: асинхронна черга для результатів сканування
     """
-    global es # Отримуємо доступ до глобальної змінної es
-    if es is None:
-        print("Модуль введення даних не може працювати: Elasticsearch не підключено.")
+    if es_client is None:
+        print("Модуль введення даних не може працювати: Elasticsearch клієнт не надано.")
         # Чекати на сигнал завершення, щоб коректно завершити чергу
         while True:
             item = await results_queue.get()
@@ -153,7 +115,7 @@ async def ingest_scan_results(results_queue):
         scan_result = await results_queue.get()
         if scan_result is None: # Сигнал завершення
             if batch: # Індексуємо останню неповну пачку
-                await index_batch(batch)
+                await index_batch(es_client, batch) # Передаємо es_client
             results_queue.task_done()
             break
 
@@ -161,17 +123,19 @@ async def ingest_scan_results(results_queue):
         batch.append(document)
 
         if len(batch) >= batch_size:
-            await index_batch(batch)
+            await index_batch(es_client, batch) # Передаємо es_client
             batch = [] # Очистити пачку після індексації
         
         results_queue.task_done()
 
-async def index_batch(documents):
+async def index_batch(es_client: AsyncElasticsearch, documents: list):
     """
     Виконує масову індексацію документів в Elasticsearch.
+    es_client: екземпляр AsyncElasticsearch
+    documents: список документів для індексації
     """
-    if es is None or not documents: # Змінено: перевіряємо es, оскільки він може бути None
-        print("Elasticsearch клієнт недоступний для індексації.")
+    if es_client is None or not documents:
+        print("Elasticsearch клієнт недоступний або немає документів для індексації.")
         return
 
     actions = [
@@ -187,7 +151,7 @@ async def index_batch(documents):
         # Використовуємо bulk API для ефективної індексації
         # 'op_type': 'index' - створити або замінити документ, якщо він вже існує.
         # Це корисно для оновлення timestamp_last_seen при повторному скануванні.
-        success, failed = await es.options(request_timeout=30).bulk(operations=actions, op_type='index')
+        success, failed = await es_client.options(request_timeout=30).bulk(operations=actions, op_type='index') # Використовуємо es_client
         
         if failed:
             print(f"Помилка індексації деяких документів: {len(failed)} невдалих.")
@@ -202,13 +166,17 @@ async def index_batch(documents):
         print(f"Непередбачена помилка під час індексації: {e}")
 
 # Функція для створення індексу в Elasticsearch (викликається один раз при запуску програми)
-async def create_index_if_not_exists():
-    global es # Отримуємо доступ до глобальної змінної es
-    if es is None:
-        print("Не можу створити індекс: Elasticsearch не підключено.")
+# Змінено: Тепер приймає es_client як аргумент
+async def create_index_if_not_exists(es_client: AsyncElasticsearch):
+    """
+    Створює індекс Elasticsearch, якщо він не існує.
+    es_client: екземпляр AsyncElasticsearch
+    """
+    if es_client is None:
+        print("Не можу створити індекс: Elasticsearch клієнт не надано.")
         return False
     
-    if not await es.indices.exists(index=INDEX_NAME):
+    if not await es_client.indices.exists(index=INDEX_NAME): # Використовуємо es_client
         print(f"Індекс '{INDEX_NAME}' не знайдено, створюємо...")
         # Визначаємо маппінг для індексу
         mapping = {
@@ -239,7 +207,7 @@ async def create_index_if_not_exists():
             }
         }
         try:
-            await es.indices.create(index=INDEX_NAME, body=mapping)
+            await es_client.indices.create(index=INDEX_NAME, body=mapping) # Використовуємо es_client
             print(f"Індекс '{INDEX_NAME}' успішно створено.")
             return True
         except ApiError as e:
@@ -252,6 +220,30 @@ async def create_index_if_not_exists():
         print(f"Індекс '{INDEX_NAME}' вже існує.")
         return True
 
+# Функція для ініціалізації клієнта ES (використовується для автономного тестування ingester)
+async def initialize_es_client_for_ingester_test():
+    try:
+        temp_es = AsyncElasticsearch([{'host': 'localhost', 'port': 9284, 'scheme': 'http'}])
+        if await temp_es.ping():
+            print("Успішно підключено до Elasticsearch для автономного тестування.")
+            return temp_es
+        else:
+            print("Попередження: Не вдалося підключитися до Elasticsearch для автономного тестування.")
+            return None
+    except ConnectionError as e:
+        print(f"Помилка підключення до Elasticsearch для автономного тестування: {e}")
+        return None
+    except Exception as e:
+        print(f"Критична помилка при ініціалізації клієнта ES для автономного тестування: {e}")
+        return None
+
+# Функція для закриття клієнта ES (використовується для автономного тестування ingester)
+async def close_es_client_for_ingester_test(client: AsyncElasticsearch):
+    if client:
+        await client.close()
+        print("Клієнт Elasticsearch для автономного тестування закрито.")
+
+
 if __name__ == "__main__":
     # Приклад автономного тестування модуля введення даних
     async def test_ingester():
@@ -262,22 +254,26 @@ if __name__ == "__main__":
         await test_queue.put({'ip': '192.168.1.1', 'port': 443, 'banner': 'Nginx/1.18.0 (Ubuntu)'})
         await test_queue.put({'ip': '192.168.1.2', 'port': 21, 'banner': '220 ProFTPD 1.3.6 Server (Debian) [::ffff:192.168.1.2]'})
 
-        # Ініціалізуємо ES клієнт перед використанням
-        if not await initialize_es_client():
-            print("Тестування ingester не може продовжитись без підключення до Elasticsearch.")
-            return
+        es_client_test = None
+        try:
+            # Ініціалізуємо ES клієнт перед використанням
+            es_client_test = await initialize_es_client_for_ingester_test()
+            if es_client_test is None:
+                print("Тестування ingester не може продовжитись без підключення до Elasticsearch.")
+                return
 
-        # Створюємо індекс, якщо його немає
-        await create_index_if_not_exists()
+            # Створюємо індекс, якщо його немає
+            await create_index_if_not_exists(es_client_test)
 
-        # Запускаємо ingester
-        ingester_task = asyncio.create_task(ingest_scan_results(test_queue))
-        
-        # Сигналізуємо ingester'у про завершення після того, як всі дані поміщені
-        await test_queue.put(None)
-        await test_queue.join() # Чекаємо, поки всі завдання з черги будуть виконані
-        await ingester_task # Чекаємо завершення самого ingester'а
-        print("\nТестове введення даних завершено.")
-        await close_es_client() # Закриваємо клієнт після тестування
+            # Запускаємо ingester
+            ingester_task = asyncio.create_task(ingest_scan_results(es_client_test, test_queue))
+            
+            # Сигналізуємо ingester'у про завершення після того, як всі дані поміщені
+            await test_queue.put(None)
+            await test_queue.join() # Чекаємо, поки всі завдання з черги будуть виконані
+            await ingester_task # Чекаємо завершення самого ingester'а
+            print("\nТестове введення даних завершено.")
+        finally:
+            await close_es_client_for_ingester_test(es_client_test) # Закриваємо клієнт після тестування
 
     asyncio.run(test_ingester())

@@ -4,68 +4,52 @@ from elasticsearch import AsyncElasticsearch, ConnectionError, NotFoundError, Ap
 
 app = Flask(__name__)
 
-# Змінено: Змінна es тепер ініціалізується як None. 
-# Клієнт буде створений асинхронно при першому запиті або в on_startup
-es: AsyncElasticsearch = None 
+# Змінна es тепер ініціалізується як None.
+# Клієнт буде створений і закритий в хуках життєвого циклу програми.
+es_client_api: AsyncElasticsearch = None # Перейменували, щоб уникнути конфлікту імен
 
 INDEX_NAME = "scan_results"
 
-# Функція для ініціалізації клієнта Elasticsearch для API
-async def init_api_es_client():
-    global es
-    if es: # Якщо клієнт вже існує, закриваємо його, щоб уникнути Unclosed client session
-        try:
-            await es.close()
-            print("Попередній клієнт Elasticsearch для API закрито.")
-        except Exception as e:
-            print(f"Помилка при закритті попереднього клієнта ES для API: {e}")
-
+@app.before_serving
+async def startup_event():
+    """
+    Викликається перед першим запитом для ініціалізації клієнта Elasticsearch.
+    Цей хук добре працює з ASGI серверами, такими як Hypercorn.
+    """
+    global es_client_api
     try:
-        es = AsyncElasticsearch([{'host': 'localhost', 'port': 9284, 'scheme': 'http'}])
-        if await es.ping():
+        es_client_api = AsyncElasticsearch([{'host': 'localhost', 'port': 9284, 'scheme': 'http'}])
+        if await es_client_api.ping():
             print("Веб-інтерфейс: Успішно підключено до Elasticsearch.")
-            return True
         else:
-            print("Веб-інтерфейс: Попередження: Не вдалося підключитися до Elasticsearch.")
-            es = None
-            return False
+            print("Веб-інтерфейс: Попередження: Не вдалося підключитися до Elasticsearch. Функціонал пошуку може бути обмежений.")
+            es_client_api = None
     except ConnectionError as e:
-        print(f"Веб-інтерфейс: Помилка підключення до Elasticsearch: {e}")
-        es = None
-        return False
+        print(f"Веб-інтерфейс: Помилка підключення до Elasticsearch під час запуску: {e}. Функціонал пошуку може бути обмежений.")
+        es_client_api = None
     except Exception as e:
-        print(f"Веб-інтерфейс: Критична помилка при ініціалізації клієнта Elasticsearch: {e}")
-        es = None
-        return False
+        print(f"Веб-інтерфейс: Критична помилка при ініціалізації клієнта Elasticsearch під час запуску: {e}. Функціонал пошуку може бути обмежений.")
+        es_client_api = None
 
-# Функція для закриття клієнта Elasticsearch для API
-async def close_api_es_client():
-    global es
-    if es:
+@app.teardown_serving
+async def shutdown_event():
+    """
+    Викликається після завершення роботи сервера для закриття клієнта Elasticsearch.
+    """
+    global es_client_api
+    if es_client_api:
         print("Веб-інтерфейс: Закриття клієнта Elasticsearch...")
-        await es.close()
+        await es_client_api.close()
         print("Веб-інтерфейс: Клієнт Elasticsearch закрито.")
-        es = None
-
-# Додаємо обробники для життєвого циклу Flask (вимагає ASGI сервера для повного функціоналу)
-@app.before_request
-async def before_request_hook():
-    global es
-    if es is None:
-        await init_api_es_client() # Спробувати ініціалізувати клієнт при першому запиті, якщо він не доступний
-
-@app.teardown_request
-async def teardown_request_hook(exception=None):
-    pass # Клієнт ES не закриваємо після кожного запиту, закриємо при завершенні роботи додатку
+        es_client_api = None
 
 @app.route('/')
-async def home(): # Змінено: робимо функцію асинхронною
+async def home(): # Робимо функцію асинхронною
     return "Ласкаво просимо до ScanEngine! Використовуйте /search для пошуку."
 
 @app.route('/search', methods=['GET'])
 async def search_data():
-    global es # Отримуємо доступ до глобальної змінної es
-    if es is None:
+    if es_client_api is None:
         return jsonify({"error": "Elasticsearch недоступний. Будь ласка, запустіть його та перевірте підключення веб-інтерфейсу."}), 500
 
     query_string = request.args.get('q', '') # Пошуковий запит
@@ -115,7 +99,7 @@ async def search_data():
 
 
     try:
-        response = await es.search(index=INDEX_NAME, body=es_query)
+        response = await es_client_api.search(index=INDEX_NAME, body=es_query) # Використовуємо es_client_api
         
         hits = response['hits']['hits']
         total_hits = response['hits']['total']['value']
@@ -137,13 +121,12 @@ async def search_data():
 
 @app.route('/device/<ip_address>/<port>', methods=['GET'])
 async def get_device_details(ip_address, port):
-    global es # Отримуємо доступ до глобальної змінної es
-    if es is None:
+    if es_client_api is None:
         return jsonify({"error": "Elasticsearch недоступний. Будь ласка, запустіть його та перевірте підключення веб-інтерфейсу."}), 500
 
     device_id = f"{ip_address}-{port}" # Використовуємо той самий ID, що і при індексації
     try:
-        response = await es.get(index=INDEX_NAME, id=device_id)
+        response = await es_client_api.get(index=INDEX_NAME, id=device_id) # Використовуємо es_client_api
         if response['found']:
             return jsonify(response['_source'])
         else:
@@ -157,31 +140,10 @@ async def get_device_details(ip_address, port):
         print(f"Непередбачена помилка під час отримання деталей: {e}")
         return jsonify({"error": "Невідома помилка сервера."}), 500
 
-# Додаємо функцію для запуску з ASGI-сервером
-async def run_api_server():
-    # Запускаємо клієнт ES для API перед запуском сервера
-    await init_api_es_client()
-
-    # Запуск Flask-додатку за допомогою ASGI сервера (наприклад, Hypercorn)
-    # Вам потрібно буде встановити 'hypercorn': pip install hypercorn
-    # Потім запускати: hypercorn src.api:app --bind 0.0.0.0:5000
-    print("Веб-сервер Flask готовий до запуску.")
-    print("Для запуску виконайте (в окремому терміналі):")
-    print("pip install hypercorn")
-    print("hypercorn src.api:app --bind 0.0.0.0:5000 --worker-class asyncio --workers 1") # Використання --worker-class asyncio для асинхронних View Functions
-    
-# Цей блок залишаємо для локального тестування, але для продукції краще використовувати ASGI
 if __name__ == '__main__':
-    # Flask 2.x+ дозволяє асинхронні View Functions з вбудованим сервером
-    print("Запуск веб-сервера Flask на http://127.0.0.1:5000/ (вбудований сервер)")
-    print("Для пошуку використовуйте: http://127.0.0.1:5000/search?q=<ваш_запит>")
-    print("Наприклад: http://127.0.0.1:5000/search?q=SSH")
-    
-    # Ініціалізуємо ES клієнт при запуску API
-    asyncio.run(init_api_es_client())
-    
-    app.run(debug=True, port=5000)
-    # Після завершення роботи веб-сервера, закриваємо клієнт ES
-    # Це може не спрацювати автоматично для app.run()
-    # Якщо потрібно явно закрити, додайте логіку завершення процесу
-    asyncio.run(close_api_es_client())
+    # Змінено: Тепер надаємо інструкції для запуску через Hypercorn
+    print("Для запуску веб-інтерфейсу (API) ScanEngine, виконайте в терміналі:")
+    print("1. Переконайтеся, що ви активували віртуальне середовище.")
+    print("2. Встановіть Hypercorn, якщо ще не встановлено: pip install hypercorn")
+    print("3. Запустіть сервер: hypercorn src.api:app --bind 0.0.0.0:5000 --worker-class asyncio --workers 1")
+    print("\nПісля запуску, перейдіть до http://127.0.0.1:5000/search?q=<ваш_запит>")
