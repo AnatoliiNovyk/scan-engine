@@ -1,25 +1,50 @@
 import asyncio
 import json
 from datetime import datetime
-from elasticsearch import Elasticsearch, ConnectionError, NotFoundError, ApiError
+from elasticsearch import AsyncElasticsearch, ConnectionError, NotFoundError, ApiError
 
-# Налаштування з'єднання з Elasticsearch
-# Вам потрібно буде розкоментувати це і, можливо, налаштувати автентифікацію
-# Якщо ви відключили безпеку в elasticsearch.yml, то це може бути достатньо:
-try:
-    es = Elasticsearch([{'host': 'localhost', 'port': 9284, 'scheme': 'http'}])
-    # Перевірка з'єднання
-    if not es.ping():
-        print("Попередження: Не вдалося підключитися до Elasticsearch. Перевірте, чи він запущений на http://localhost:9284")
-        # Якщо підключення без http://, спробуйте так:
-        # es = Elasticsearch("http://localhost:9284")
-    else:
-        print("Успішно підключено до Elasticsearch.")
-except ConnectionError as e:
-    print(f"Помилка підключення до Elasticsearch: {e}")
-    es = None # Встановити es в None, якщо підключення не вдалося
+# Змінено: Змінна es тепер ініціалізується як None. 
+# Клієнт буде створений асинхронно функцією initialize_es_client()
+es: AsyncElasticsearch = None 
 
 INDEX_NAME = "scan_results"
+
+# Функція для асинхронної ініціалізації клієнта Elasticsearch
+async def initialize_es_client():
+    global es
+    if es: # Якщо клієнт вже існує, закриваємо його, щоб уникнути Unclosed client session
+        try:
+            await es.close()
+            print("Попередній клієнт Elasticsearch закрито.")
+        except Exception as e:
+            print(f"Помилка при закритті попереднього клієнта ES: {e}")
+            
+    try:
+        es = AsyncElasticsearch([{'host': 'localhost', 'port': 9284, 'scheme': 'http'}])
+        if await es.ping():
+            print("Успішно підключено до Elasticsearch.")
+            return True
+        else:
+            print("Попередження: Не вдалося підключитися до Elasticsearch. Перевірте, чи він запущений на http://localhost:9284")
+            es = None # Якщо ping не вдається, вважаємо, що es не підключений
+            return False
+    except ConnectionError as e:
+        print(f"Помилка підключення до Elasticsearch: {e}")
+        es = None
+        return False
+    except Exception as e:
+        print(f"Критична помилка при ініціалізації клієнта Elasticsearch: {e}")
+        es = None
+        return False
+
+# Функція для закриття клієнта Elasticsearch
+async def close_es_client():
+    global es
+    if es:
+        print("Закриття клієнта Elasticsearch...")
+        await es.close()
+        print("Клієнт Elasticsearch закрито.")
+        es = None
 
 # ---- Заглушки для збагачення даних ----
 def get_geolocation(ip_address):
@@ -107,6 +132,7 @@ async def ingest_scan_results(results_queue):
     """
     Асинхронно отримує результати сканування з черги, збагачує їх та індексує в Elasticsearch.
     """
+    global es # Отримуємо доступ до глобальної змінної es
     if es is None:
         print("Модуль введення даних не може працювати: Elasticsearch не підключено.")
         # Чекати на сигнал завершення, щоб коректно завершити чергу
@@ -144,7 +170,8 @@ async def index_batch(documents):
     """
     Виконує масову індексацію документів в Elasticsearch.
     """
-    if not es or not documents:
+    if es is None or not documents: # Змінено: перевіряємо es, оскільки він може бути None
+        print("Elasticsearch клієнт недоступний для індексації.")
         return
 
     actions = [
@@ -176,6 +203,7 @@ async def index_batch(documents):
 
 # Функція для створення індексу в Elasticsearch (викликається один раз при запуску програми)
 async def create_index_if_not_exists():
+    global es # Отримуємо доступ до глобальної змінної es
     if es is None:
         print("Не можу створити індекс: Elasticsearch не підключено.")
         return False
@@ -234,6 +262,11 @@ if __name__ == "__main__":
         await test_queue.put({'ip': '192.168.1.1', 'port': 443, 'banner': 'Nginx/1.18.0 (Ubuntu)'})
         await test_queue.put({'ip': '192.168.1.2', 'port': 21, 'banner': '220 ProFTPD 1.3.6 Server (Debian) [::ffff:192.168.1.2]'})
 
+        # Ініціалізуємо ES клієнт перед використанням
+        if not await initialize_es_client():
+            print("Тестування ingester не може продовжитись без підключення до Elasticsearch.")
+            return
+
         # Створюємо індекс, якщо його немає
         await create_index_if_not_exists()
 
@@ -245,5 +278,6 @@ if __name__ == "__main__":
         await test_queue.join() # Чекаємо, поки всі завдання з черги будуть виконані
         await ingester_task # Чекаємо завершення самого ingester'а
         print("\nТестове введення даних завершено.")
+        await close_es_client() # Закриваємо клієнт після тестування
 
     asyncio.run(test_ingester())

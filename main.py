@@ -2,14 +2,20 @@ import asyncio
 import sys
 # Імпортуємо функції з наших модулів
 from src.async_scanner import main_async_scanner
-from src.data_ingester import ingest_scan_results, create_index_if_not_exists, es as data_ingester_es # Імпортуємо es з ingester для перевірки з'єднання
+# Змінено: імпортуємо initialize_es_client та close_es_client
+from src.data_ingester import ingest_scan_results, create_index_if_not_exists, initialize_es_client, close_es_client, es as data_ingester_es 
 
 async def main():
     print("--- Запуск ScanEngine ---")
 
-    # 1. Перевірка та створення індексу Elasticsearch
-    if data_ingester_es is None or not await create_index_if_not_exists():
+    # 1. Ініціалізація та перевірка індексу Elasticsearch
+    print("Ініціалізація клієнта Elasticsearch та перевірка індексу...")
+    if not await initialize_es_client(): # Викликаємо нову асинхронну функцію ініціалізації
         print("Критична помилка: Не вдалося підготувати Elasticsearch. Завершення роботи.")
+        sys.exit(1)
+    
+    if not await create_index_if_not_exists():
+        print("Критична помилка: Не вдалося створити/перевірити індекс Elasticsearch. Завершення роботи.")
         sys.exit(1)
 
     # 2. Ініціалізація спільних черг
@@ -55,6 +61,30 @@ async def main():
     print("Тепер ви можете запустити веб-інтерфейс, виконавши 'python src/api.py' та перейти до http://127.0.0.1:5000/search?q=<ваш_запит>")
 
 if __name__ == "__main__":
-    # Додано loop_factory для Windows (може знадобитись для деяких версій Python/asyncio)
+    # Для Windows, можливо, знадобиться встановити політику циклу подій
     # asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy()) 
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        # Закриваємо клієнт ES після завершення головної функції
+        # Цей виклик має бути поза asyncio.run, щоб він міг закрити клієнт.
+        # Однак es клієнт міг бути None, якщо ініціалізація не вдалася.
+        # Тому перевіряємо це.
+        import src.data_ingester # Потрібно імпортувати, щоб отримати доступ до es
+        if src.data_ingester.es is not None:
+            # Для закриття клієнта потрібен running loop
+            # Це може бути складніше закрити після того, як основний цикл закритий.
+            # Якщо виникне помилка Unclosed client session, ми її обробимо.
+            try:
+                loop = asyncio.get_event_loop()
+                if not loop.is_running(): # Якщо цикл не запущений, створюємо новий тимчасовий
+                    new_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(new_loop)
+                    new_loop.run_until_complete(src.data_ingester.close_es_client())
+                    new_loop.close()
+                else: # Якщо цикл запущений (наприклад, у тестуванні), закриваємо у ньому
+                    loop.run_until_complete(src.data_ingester.close_es_client())
+            except RuntimeError as e:
+                print(f"Помилка при закритті ES клієнта: {e}. Можливо, цикл подій вже закритий.")
+            except Exception as e:
+                print(f"Непередбачена помилка при закритті ES клієнта: {e}")
