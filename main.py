@@ -12,7 +12,8 @@ async def main():
     # 1. Ініціалізація клієнта Elasticsearch
     es_client = None # Ініціалізуємо тут для області видимості
     try:
-        es_client = AsyncElasticsearch([{'host': 'localhost', 'port': 9284, 'scheme': 'http'}])
+        # Змінено: використовуємо новий хост і порт
+        es_client = AsyncElasticsearch([{'host': '172.18.144.1', 'port': 9200, 'scheme': 'http'}])
         # Перевірка з'єднання
         if not await es_client.ping():
             print("Критична помилка: Не вдалося підключитися до Elasticsearch. Завершення роботи.")
@@ -21,7 +22,7 @@ async def main():
             print("Успішно підключено до Elasticsearch.")
 
         # 2. Перевірка та створення індексу Elasticsearch
-        # Змінено: передаємо es_client до create_index_if_not_exists
+        # Передаємо es_client до create_index_if_not_exists
         if not await create_index_if_not_exists(es_client): 
             print("Критична помилка: Не вдалося створити/перевірити індекс Elasticsearch. Завершення роботи.")
             sys.exit(1)
@@ -32,7 +33,7 @@ async def main():
         # 4. Налаштування параметрів сканування
         # Важливо: використовуйте IP-діапазони, які ви маєте право сканувати!
         # Для тестування можна використовувати: ["127.0.0.1/30"] або ["192.168.1.0/29"] для невеликих локальних мереж.
-        ip_ranges = ["127.0.0.1/30"] 
+        ip_ranges = ["scanme.nmap.org"] 
         # Список портів, які потрібно сканувати. Можна також передати None, щоб використати порти за замовчуванням у scanner.py
         ports = [22, 80, 443, 8080] 
         max_scanner_workers = 100 # Кількість одночасних задач сканування

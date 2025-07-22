@@ -221,17 +221,17 @@ async def create_index_if_not_exists(es_client: AsyncElasticsearch):
         return True
 
 # Функція для ініціалізації клієнта ES (використовується для автономного тестування ingester)
-async def initialize_es_client_for_ingester_test():
+async def initialize_es_client_for_ingester_test(host="172.18.144.1", port=9200): # Оновлено хост і порт
     try:
-        temp_es = AsyncElasticsearch([{'host': 'localhost', 'port': 9284, 'scheme': 'http'}])
+        temp_es = AsyncElasticsearch([{'host': host, 'port': port, 'scheme': 'http'}])
         if await temp_es.ping():
-            print("Успішно підключено до Elasticsearch для автономного тестування.")
+            print(f"Успішно підключено до Elasticsearch для автономного тестування на {host}:{port}.")
             return temp_es
         else:
-            print("Попередження: Не вдалося підключитися до Elasticsearch для автономного тестування.")
+            print(f"Попередження: Не вдалося підключитися до Elasticsearch для автономного тестування на {host}:{port}.")
             return None
     except ConnectionError as e:
-        print(f"Помилка підключення до Elasticsearch для автономного тестування: {e}")
+        print(f"Помилка підключення до Elasticsearch для автономного тестування на {host}:{port}: {e}")
         return None
     except Exception as e:
         print(f"Критична помилка при ініціалізації клієнта ES для автономного тестування: {e}")

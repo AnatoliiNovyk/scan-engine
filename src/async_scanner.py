@@ -4,7 +4,7 @@ import socket
 import sys
 
 # Функція для асинхронного сканування одного порту
-async def scan_port_async(ip_address, port, timeout=1):
+async def scan_port_async(ip_address, port, timeout=5):
     """
     Проводить асинхронне SYN-сканування одного порту і намагається отримати банер.
     Повертає банер, якщо порт відкритий, інакше None.
@@ -15,7 +15,7 @@ async def scan_port_async(ip_address, port, timeout=1):
         
         # Порт відкритий, намагаємося отримати банер
         try:
-            writer.write(b'\n\r\n') # Відправка простого запиту для багатьох сервісів
+            writer.write(b'\n\\r\\n') # Відправка простого запиту для багатьох сервісів
             await writer.drain()
             banner = await asyncio.wait_for(reader.read(1024), timeout=timeout)
             banner = banner.decode('utf-8', errors='ignore').strip()
@@ -62,6 +62,19 @@ async def worker(ip_queue, results_queue):
 
         ip_queue.task_done()
 
+async def resolve_hostname(hostname):
+    """
+    Асинхронно перетворює ім'я хоста на IP-адресу.
+    Використовує run_in_executor для неблокуючого виклику socket.gethostbyname.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        ip_address = await loop.run_in_executor(None, socket.gethostbyname, hostname)
+        return ip_address
+    except socket.gaierror:
+        print(f"Помилка: Не вдалося перетворити ім'я хоста '{hostname}' на IP-адресу.")
+        return None
+
 async def main_async_scanner(ip_ranges_cidr, ports_to_scan_override=None, max_scanner_workers=100, results_queue=None):
     """
     Основна асинхронна функція для сканування діапазонів IP.
@@ -74,13 +87,31 @@ async def main_async_scanner(ip_ranges_cidr, ports_to_scan_override=None, max_sc
     ip_queue = asyncio.Queue()
     all_ips = []
 
-    for ip_range_cidr in ip_ranges_cidr:
+    for ip_entry in ip_ranges_cidr: # Змінено: тепер ip_entry може бути ім'ям хоста або CIDR
         try:
-            network = ipaddress.ip_network(ip_range_cidr, strict=False)
+            # Спроба перетворити на IP-мережу/адресу
+            network = ipaddress.ip_network(ip_entry, strict=False)
             all_ips.extend([str(ip) for ip in network.hosts()])
-        except ValueError as e:
-            print(f"Помилка: Невірний діапазон IP {ip_range_cidr}: {e}")
-            sys.exit(1) # Завершити виконання, якщо діапазон некоректний
+        except ValueError:
+            # Якщо це не IP-мережа, спробувати перетворити як ім'я хоста
+            resolved_ip = await resolve_hostname(ip_entry)
+            if resolved_ip:
+                # Перетворюємо розпізнаний IP на мережу /32 для сканування
+                all_ips.append(str(ipaddress.ip_network(resolved_ip + "/32").network_address))
+            else:
+                print(f"Пропущено: '{ip_entry}' не є дійсною IP-мережею або іменем хоста.")
+                continue # Пропускаємо цю некоректну сутність
+
+    # Видаляємо дублікати IP-адрес
+    all_ips = list(set(all_ips))
+    if not all_ips:
+        print("Не знайдено дійсних IP-адрес для сканування. Завершення.")
+        # Поміщаємо сигнали завершення для робітників, щоб вони не зависали
+        for _ in range(max_scanner_workers):
+            await ip_queue.put(None)
+        await asyncio.gather(*[asyncio.create_task(worker(ip_queue, results_queue)) for _ in range(max_scanner_workers)], return_exceptions=True)
+        return
+
 
     print(f"Ініціалізація сканування для {len(all_ips)} унікальних хостів.")
 
@@ -119,8 +150,8 @@ if __name__ == "__main__":
 
     # Запускаємо сканер. Результати будуть виведені в консоль, а також поміщені в test_results_queue.
     async def run_test_scanner():
-        # Змінено: ip_ranges_cidr тепер список
-        await main_async_scanner(["127.0.0.1/30"], [22, 80, 443], max_scanner_workers=5, results_queue=test_results_queue)
+        # Змінено: ip_ranges_cidr тепер список, може містити доменні імена
+        await main_async_scanner(["scanme.nmap.org"], [22, 80, 443], max_scanner_workers=5, results_queue=test_results_queue)
         # Додатково: вивести те, що було поміщено в чергу
         print("\n--- Зібрані результати (з черги) ---")
         while not test_results_queue.empty():
